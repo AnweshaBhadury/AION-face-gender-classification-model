@@ -1,152 +1,161 @@
-from retinaface import RetinaFace
-import cv2
-from PIL import Image
-import torch
-from facenet_pytorch import InceptionResnetV1
-import numpy as np
-from train import train_gender_classifier
-from train2 import train_facenet
-from keras.models import load_model
-from keras.applications.efficientnet import preprocess_input
+# main.py – flexible pipeline for webcam, video, or single image
+# ------------------------------------------------------------
+# Usage examples:
+#   python main.py --source 0              # webcam
+#   python main.py --source myvideo.mp4    # video file
+#   python main.py --source photo.jpg      # image file
+#   python main.py                         # interactive prompt
+
 import os
 import csv
+import argparse
+import cv2
+import torch
+import numpy as np
+from retinaface import RetinaFace
+from facenet_pytorch import InceptionResnetV1
+from keras.models import load_model
+from keras.applications.efficientnet import preprocess_input
 
-# Define dataset paths
-train_dir = r'E:\comsys hackathon\Comys_Hackathon5\Task_A\train'
-val_dir = r'E:\comsys hackathon\Comys_Hackathon5\Task_A\val'
-facenet_train_dir = r"E:\comsys hackathon\Comys_Hackathon5\Task_B\train"
+from train import train_gender_classifier
+from train2 import train_facenet
 
-# Train or load the gender classification model
+# --------------------------- Helpers ---------------------------
+
+def is_image_file(path: str) -> bool:
+    return os.path.splitext(path)[1].lower() in {".jpg", ".jpeg", ".png", ".bmp"}
+
+# Adaptive resize for display (keeps width ≤ max_w)
+def adaptive_resize(img: np.ndarray, max_w: int = 960) -> np.ndarray:
+    h, w = img.shape[:2]
+    scale = min(max_w / w, 1.0)
+    return cv2.resize(img, (int(w * scale), int(h * scale)))
+
+# --------------------------- CLI Args --------------------------
+
+parser = argparse.ArgumentParser(description="Face‑Gender classification on webcam / video / image")
+parser.add_argument("--source", help="0 (webcam), video file, or image file path")
+args = parser.parse_args()
+
+SOURCE = args.source.strip() if args.source else input("Enter source (0/webcam, video file, or image path): ").strip()
+
+# ---------------------- Load Gender Model ----------------------
+print("[INFO] Loading EfficientNet gender classifier …")
 try:
-    model = load_model('gender_classification_efficientnet_final.keras')
-    print("Loaded trained model from 'gender_classification_efficientnet.keras'.")
+    gender_model = load_model("gender_classification_efficientnet_final.keras")
 except (IOError, OSError):
-    print("Trained model not found. Training the model now...")
-    model, history = train_gender_classifier(train_dir, val_dir)
-    print("Training completed. Model saved as 'gender_classification_efficientnet.keras'")
+    DATA_ROOT = r"E:\comsys hackathon\Comys_Hackathon5"
+    gender_model, _ = train_gender_classifier(
+        os.path.join(DATA_ROOT, "Task_A", "train"),
+        os.path.join(DATA_ROOT, "Task_A", "val"),
+    )
+print("[INFO] Gender model ready.")
 
-# FaceNet model loading or training
-facenet_model_path = "facenet_triplet.pth"
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
+# ---------------------- Load FaceNet Model ---------------------
+print("[INFO] Loading FaceNet backbone …")
+FACENET_W = "facenet_triplet.pth"
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+facenet = InceptionResnetV1(pretrained=None, classify=False).to(device)
 try:
-    facenet = InceptionResnetV1(pretrained='vggface2', classify=False).eval().to(device)
-    # Only modify these layers if it's a new model
-    if not os.path.exists(facenet_model_path):
-        facenet.last_linear = torch.nn.Linear(facenet.last_linear.in_features, 128)
-        facenet.last_bn = torch.nn.BatchNorm1d(128)
-    else:
-        facenet.load_state_dict(torch.load(facenet_model_path, map_location=device))
-    print(f"Loaded FaceNet model from '{facenet_model_path}'.")
-except Exception as e:
-    print(f"FaceNet model error: {e}. Training the model now...")
-    train_facenet(facenet_train_dir)
-    facenet = InceptionResnetV1(pretrained='vggface2', classify=False)
-    facenet.last_linear = torch.nn.Linear(facenet.last_linear.in_features, 128)
-    facenet.last_bn = torch.nn.BatchNorm1d(128)
-    facenet.load_state_dict(torch.load(facenet_model_path, map_location=device))
-    facenet = facenet.eval().to(device)
+    ckpt = torch.load(FACENET_W, map_location=device)
+    ckpt = {k: v for k, v in ckpt.items() if not k.startswith(("last_linear", "last_bn"))}
+    facenet.load_state_dict(ckpt, strict=False)
+except (FileNotFoundError, RuntimeError):
+    DATA_ROOT = r"E:\comsys hackathon\Comys_Hackathon5"
+    train_facenet(
+        os.path.join(DATA_ROOT, "Task_B", "train"),
+        os.path.join(DATA_ROOT, "Task_B", "val"),
+    )
+    ckpt = torch.load(FACENET_W, map_location=device)
+    ckpt = {k: v for k, v in ckpt.items() if not k.startswith(("last_linear", "last_bn"))}
+    facenet.load_state_dict(ckpt, strict=False)
+facenet.eval()
+print("[INFO] FaceNet ready.")
 
-# -------------------- VIDEO PROCESSING BEGINS --------------------
+# -------------------- Frame Processing ------------------------
 
-# Setup video input/output
-video_path = "samplevideo.mp4"  # 0 for webcam, or path to video file e.g. 'input.mp4'
-cap = cv2.VideoCapture(video_path)
-if not cap.isOpened():
-    raise IOError(f"Cannot open video source: {video_path}")
+def process_frame(frame: np.ndarray, frame_idx: int, csv_writer=None):
+    faces = RetinaFace.detect_faces(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    if not faces or not isinstance(faces, dict):
+        return frame
 
-frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-fps = cap.get(cv2.CAP_PROP_FPS) or 20
-fourcc = cv2.VideoWriter_fourcc(*'XVID')
-out = cv2.VideoWriter('output.avi', fourcc, fps, (frame_width, frame_height))
-
-# Optional: write predictions to CSV
-csv_file = open('predictions.csv', mode='w', newline='')
-csv_writer = csv.writer(csv_file)
-csv_writer.writerow(['Frame', 'Face_ID', 'Gender', 'Probability'])
-
-frame_count = 0
-
-try:
-    while True:
-        ret, img = cap.read()
-        if not ret:
-            break
-        frame_count += 1
-
-        cv2.imwrite("temp_frame.jpg", img)
-        faces = RetinaFace.detect_faces("temp_frame.jpg")
-        
-        if not faces or not isinstance(faces, dict):
-            faces = {}
-            out.write(img)
+    for fid, info in faces.items():
+        x1, y1, x2, y2 = info["facial_area"]
+        h, w = frame.shape[:2]
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w - 1, x2), min(h - 1, y2)
+        if x2 <= x1 or y2 <= y1:
             continue
 
-        for face_id, face_data in faces.items():
-            try:
-                facial_area = face_data['facial_area']
-                x1, y1, x2, y2 = facial_area
-                x1, y1 = max(0, x1), max(0, y1)
-                x2, y2 = min(img.shape[1] - 1, x2), min(img.shape[0] - 1, y2)
-                if x2 <= x1 or y2 <= y1:
-                    continue
+        face = frame[y1:y2, x1:x2]
+        face_rgb = cv2.cvtColor(face, cv2.COLOR_BGR2RGB)
+        face_res = cv2.resize(face_rgb, (128, 128))
 
-                face = img[y1:y2, x1:x2]
-                face_pil = Image.fromarray(cv2.cvtColor(face, cv2.COLOR_BGR2RGB))
-                face_resized = face_pil.resize((128, 128))
-                face_array = np.array(face_resized)
+        # Gender prediction
+        pred = gender_model.predict(preprocess_input(np.expand_dims(face_res, 0)), verbose=0)[0]
+        idx = int(np.argmax(pred))
+        label = "Male" if idx == 0 else "Female"
+        prob = pred[idx]
 
-                # For gender classification
-                face_preprocessed = preprocess_input(face_array.copy())
-                face_preprocessed = np.expand_dims(face_preprocessed, axis=0)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.putText(
+            frame,
+            f"{label} ({prob:.2f})",
+            (x1, y1 - 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.2,
+            (0, 255, 0),
+            3,
+            lineType=cv2.LINE_AA
+        )
 
-                prediction = model.predict(face_preprocessed)
-                predicted_class = np.argmax(prediction, axis=1)[0]
-                class_label = 'Male' if predicted_class == 0 else 'Female'
-                prob = prediction[0][predicted_class]
+        if csv_writer:
+            csv_writer.writerow([frame_idx, fid, label, round(prob, 2)])
 
-                label = f"{class_label} ({prob:.2f})"
-                cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.putText(img, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+        ft = torch.tensor(face_res).permute(2, 0, 1).unsqueeze(0).float()
+        ft = (ft - 127.5) / 128.0
+        with torch.no_grad():
+            _ = facenet(ft.to(device))
+    return frame
 
-                # Save prediction to CSV
-                csv_writer.writerow([frame_count, face_id, class_label, round(prob, 2)])
+# ---------------------- Image Mode -----------------------------
+if is_image_file(SOURCE):
+    img = cv2.imread(SOURCE)
+    if img is None:
+        raise IOError(f"Cannot open image: {SOURCE}")
+    result = process_frame(img.copy(), 1)
+    cv2.imwrite("output.jpg", result)
+    cv2.imshow("Result", adaptive_resize(result))
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+    print("[INFO] Saved annotated image → output.jpg")
 
-                # For FaceNet embedding
-                face_tensor = torch.tensor(face_array).float().permute(2, 0, 1).unsqueeze(0)
-                face_tensor = (face_tensor - 127.5) / 128.0  # Normalization for FaceNet
-                face_tensor = face_tensor.to(device)
+# ------------------ Video / Webcam Mode ------------------------
+else:
+    cap = cv2.VideoCapture(0 if SOURCE == "0" else SOURCE)
+    if not cap.isOpened():
+        raise IOError(f"Cannot open video source: {SOURCE}")
 
-                with torch.no_grad():
-                    embedding = facenet(face_tensor)
-                # Optionally save or use embedding here
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 20
+    fourcc = cv2.VideoWriter_fourcc(*"XVID")
+    out = cv2.VideoWriter("output.avi", fourcc, fps, (w, h))
 
-            except Exception as e:
-                print(f"Error processing face {face_id} in frame {frame_count}: {str(e)}")
-                continue
+    csv_f = open("predictions.csv", "w", newline="")
+    csv_w = csv.writer(csv_f); csv_w.writerow(["Frame", "Face_ID", "Gender", "Prob"])
 
-        out.write(img)
-
-        # Dynamically resize display
-        height, width = img.shape[:2]
-        scale = min(1200 / width, 800 / height)
-        display_dim = (int(width * scale), int(height * scale))
-        display_img = cv2.resize(img, display_dim, interpolation=cv2.INTER_AREA)
-
-        cv2.imshow('Detected Faces with RetinaFace (Video)', display_img)
-
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+    idx = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        idx += 1
+        frame = process_frame(frame, idx, csv_w)
+        out.write(frame)
+        cv2.imshow("AION", adaptive_resize(frame))
+        if cv2.waitKey(1) & 0xFF == ord("q"):
             break
 
-except Exception as e:
-    print(f"Error during video processing: {str(e)}")
-
-finally:
-    # Cleanup
-    cap.release()
-    out.release()
-    csv_file.close()
-    cv2.destroyAllWindows()
-    if os.path.exists("temp_frame.jpg"):
-        os.remove("temp_frame.jpg")
+    cap.release(); out.release(); csv_f.close(); cv2.destroyAllWindows()
+    print("[INFO] Saved annotated video → output.avi & predictions.csv")
