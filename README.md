@@ -2,15 +2,9 @@
 
 This repository contains a deep learning pipeline that detects human faces and classifies their gender using an EfficientNet-based model. Face embeddings are optionally generated via a pretrained FaceNet (InceptionResNetV1) model for downstream tasks.
 
-<p align="center">
-  <img src="training_history.png" alt="Training Metrics" width="600"/>
-</p>
-
----
-
 ## 📌 Key Features
 
-* 🔍 **Face Detection** (Haarcascade + MTCNN)
+* 🔍 **Face Detection** (retinaface)
 * 👦👧 **Gender Classification** using **EfficientNetB0**
 * 🧠 **Face Embedding** using **FaceNet** (`facenet_triplet.pth`)
 * 📦 **Pretrained Weights** available for instant testing
